@@ -115,7 +115,7 @@ class QLearningAgent:
                  exploration_decay=0.9995, min_exploration_rate=0.01, q_table_file='snake.pkl'):
         self.lr = learning_rate
         self.gamma = discount_factor
-        self.initial_epsilon = exploration_rate
+        self.initial_epsilon = exploration_rate # Keep track of initial epsilon for reset
         self.epsilon = exploration_rate
         self.epsilon_decay = exploration_decay
         self.min_epsilon = min_exploration_rate
@@ -140,6 +140,7 @@ class QLearningAgent:
                     q_table_loaded = saved_data['q_table']
                     loaded_epsilon = saved_data['epsilon']
                     print(f"Loading agent state from '{self.q_table_file}'...")
+                    # Load epsilon, but initial_epsilon remains the config value (1.0)
                     self.epsilon = max(self.min_epsilon, min(self.initial_epsilon, loaded_epsilon))
                     print(f" - Loaded Epsilon: {self.epsilon:.4f}")
                 elif isinstance(saved_data, (dict, defaultdict)):
@@ -195,6 +196,7 @@ class QLearningAgent:
 
     def save_q_table(self):
         try:
+            # Always save the current epsilon
             data_to_save = {'q_table': dict(self.q_table), 'epsilon': self.epsilon}
             with open(self.q_table_file, 'wb') as f:
                 pickle.dump(data_to_save, f)
@@ -211,7 +213,7 @@ class QLearningAgent:
         elif current_dir == LEFT:   dir_l, dir_s, dir_r = DOWN, LEFT, UP
         elif current_dir == RIGHT:  dir_l, dir_s, dir_r = UP, RIGHT, DOWN
         else:
-            dir_l, dir_s, dir_r = LEFT, UP, RIGHT
+            dir_l, dir_s, dir_r = LEFT, UP, RIGHT # Fallback
 
         danger_straight = self._is_danger(head, dir_s, body_list, snake.length, steps=1)
         danger_left = self._is_danger(head, dir_l, body_list, snake.length, steps=1)
@@ -325,8 +327,9 @@ class QLearningAgent:
             self.epsilon *= self.epsilon_decay
             self.epsilon = max(self.min_epsilon, self.epsilon)
 
-def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_episode=5000,
-             auto_reset_config=None):
+
+# --- Updated Game Loop Function ---
+def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_episode=5000):
     pygame.init()
     screen = None
     font = None
@@ -350,22 +353,20 @@ def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_
     mode = "Training" if train else "Playing"
     render_status = "Visible" if render else "Non-Visible"
     print(f"\n--- Starting {mode} ({render_status}) ---")
-    print(f"Start Epsilon for this session: {agent.epsilon:.4f}")
+    print(f"Start Epsilon for this session: {agent.epsilon:.4f}") # Can be loaded value
 
     if train:
         print(f"Episodes: {num_episodes}, Max Steps/Ep: {max_steps_per_episode}")
+        print("Tetris-style Stagnation Reset: Active (Threshold: 3 intervals, Reset to initial epsilon)")
     else:
         print("Using learned policy (minimal exploration).")
         agent.epsilon = agent.min_epsilon
 
-    best_avg_score_so_far = -float('inf')
+    # Variables for Tetris-style Auto-Reset (always active in training)
+    last_logged_avg_score = -np.inf # Compare current avg to this
     stagnation_counter = 0
-    log_interval = 100
-    auto_reset_enabled = train and auto_reset_config is not None
-
-    if auto_reset_enabled:
-        print(f"Auto Epsilon Reset Enabled: Patience={auto_reset_config['patience']} intervals, Threshold={auto_reset_config['threshold']:.2f}, ResetValue={auto_reset_config['value']:.2f}")
-
+    STAGNATION_THRESHOLD = 3       # Reset after this many intervals without improvement
+    log_interval = 100             # Check performance every 100 episodes
 
     for episode in range(num_episodes):
         snake = Snake()
@@ -390,6 +391,13 @@ def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_
                             agent.save_q_table()
                         pygame.quit()
                         return scores, session_high_score
+                    # Optional: Add manual reset key like Tetris?
+                    # if event.type == pygame.KEYDOWN:
+                    #     if event.key == pygame.K_r and train:
+                    #         agent.epsilon = agent.initial_epsilon # Use initial_epsilon from agent
+                    #         print(f"\n*** Epsilon reset to {agent.epsilon:.4f} by user! ***\n")
+                    #         stagnation_counter = 0
+                    #         last_logged_avg_score = -np.inf # Reset baseline
 
             action_index = agent.choose_action(current_state, snake)
             action_direction = agent.actions[action_index]
@@ -457,37 +465,46 @@ def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_
         if train:
             agent.decay_exploration()
 
+            # --- Logging and Tetris-style Auto-Reset Check ---
             if (episode + 1) % log_interval == 0:
-                avg_score_interval = np.mean(scores[-log_interval:]) if len(scores) >= log_interval else np.mean(scores)
-                print_msg = f"Ep {episode + 1}/{num_episodes} | AvgScore(last {log_interval}): {avg_score_interval:.2f} | HighScore: {session_high_score} | Epsilon: {agent.epsilon:.4f} | Steps logged: {total_steps_session_log}"
+                if len(scores) > 0:
+                    current_avg_score = np.mean(scores[-log_interval:]) if len(scores)>=log_interval else np.mean(scores)
+                else:
+                    current_avg_score = 0.0
 
-                if auto_reset_enabled:
-                    if best_avg_score_so_far == -float('inf') and (episode + 1) >= log_interval:
-                       best_avg_score_so_far = avg_score_interval
-                       print_msg += " | Initializing best avg score."
+                print_msg = f"Ep {episode + 1}/{num_episodes} | AvgScore(last {log_interval}): {current_avg_score:.2f} | HighScore: {session_high_score} | Epsilon: {agent.epsilon:.4f} | Steps logged: {total_steps_session_log}"
 
-                    improvement = avg_score_interval - best_avg_score_so_far
-                    if improvement > auto_reset_config['threshold']:
-                        print_msg += f" | Improved! (+{improvement:.2f})"
-                        best_avg_score_so_far = avg_score_interval
-                        stagnation_counter = 0
-                    elif (episode + 1) > log_interval:
+                # --- Tetris-style Auto-Reset Logic ---
+                if last_logged_avg_score > -np.inf: # Check if we have a previous score to compare to
+                    # Compare current average to the last logged average
+                    if current_avg_score <= last_logged_avg_score:
                         stagnation_counter += 1
-                        print_msg += f" | Stagnated ({stagnation_counter}/{auto_reset_config['patience']})"
-
-                        if stagnation_counter >= auto_reset_config['patience']:
-                            old_epsilon = agent.epsilon
-                            agent.epsilon = max(agent.min_epsilon, auto_reset_config['value'])
-                            print_msg += f" | !!! AUTO-RESETTING Epsilon ({old_epsilon:.4f} -> {agent.epsilon:.4f}) !!!"
-                            stagnation_counter = 0
-                            best_avg_score_so_far = avg_score_interval
+                        print_msg += f" (Stagnation: {stagnation_counter}/{STAGNATION_THRESHOLD})"
                     else:
-                         pass
+                        # Improvement detected
+                        stagnation_counter = 0
+                        last_logged_avg_score = current_avg_score # Update baseline on improvement
+                        print_msg += " (Improved)"
+                else:
+                    # First log interval, set the initial baseline
+                    last_logged_avg_score = current_avg_score
+                    print_msg += " (Initial Log)"
+
+                # Check if stagnation threshold is reached
+                if stagnation_counter >= STAGNATION_THRESHOLD:
+                    old_epsilon = agent.epsilon
+                    # Reset epsilon to the *initial* value stored in the agent
+                    agent.epsilon = agent.initial_epsilon
+                    print_msg += f" | !!! STAGNATION RESET Epsilon ({old_epsilon:.4f} -> {agent.epsilon:.4f}) !!!"
+                    stagnation_counter = 0 # Reset counter
+                    # Update baseline score to current level to measure improvement from here
+                    last_logged_avg_score = current_avg_score
 
 
-                print(print_msg)
-                agent.save_q_table()
-                total_steps_session_log = 0
+                print(print_msg) # Print log message
+                agent.save_q_table() # Save agent state periodically
+                total_steps_session_log = 0 # Reset step counter for next log interval
+            # --- End Auto-Reset Logic ---
 
         if not train:
             print(f"Game {episode+1} finished! Score: {snake.score}, Steps: {steps_taken}")
@@ -503,9 +520,11 @@ def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_
     return scores, session_high_score
 
 
+# --- Updated Main Execution Block ---
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train or Run a Q-Learning Snake AI with Auto Epsilon Reset.")
+    parser = argparse.ArgumentParser(description="Train or Run a Q-Learning Snake AI.")
 
+    # --- Basic Modes ---
     parser.add_argument('mode', metavar='MODE', type=str, nargs='?', choices=['train', 'run'], default='run',
                         help="Operation mode: 'train' or 'run' (default: run).")
     parser.add_argument('-e', '--episodes', type=int, default=50000,
@@ -515,46 +534,40 @@ if __name__ == '__main__':
     parser.add_argument('--render-train', action='store_true',
                         help="Render the game window during training (significantly slower).")
 
+    # --- File Handling ---
     parser.add_argument('--fresh', action='store_true',
                         help="Force fresh training, ignoring any existing agent state file.")
     parser.add_argument('--qtable', type=str, default="snake.pkl",
                         help="Filename for saving/loading agent state (default: snake.pkl).")
 
+    # --- Training Parameters ---
     parser.add_argument('--max-steps', type=int, default=5000,
                         help="Maximum steps allowed per episode before termination (default: 5000).")
 
+    # --- Manual Epsilon Control ---
     parser.add_argument('--reset-epsilon', type=float, default=None,
-                        help="Manually force epsilon to this value after loading state (overrides loaded/initial). Applied at the start.")
+                        help="Manually force epsilon to this value AFTER loading state. Applied at the start.")
 
-    parser.add_argument('--auto-reset', action='store_true',
-                        help="Enable automatic epsilon reset during training if performance stagnates.")
-    parser.add_argument('--reset-patience', type=int, default=5,
-                        help="Auto-Reset: Number of logging intervals (each 100 episodes) to wait before reset (default: 5 -> 500 episodes).")
-    parser.add_argument('--reset-value', type=float, default=0.7,
-                        help="Auto-Reset: Epsilon value to reset to (e.g., 0.7) (default: 0.7).")
-    parser.add_argument('--reset-threshold', type=float, default=0.5,
-                        help="Auto-Reset: Min avg score improvement over 100 episodes needed to avoid stagnation count (default: 0.5).")
+    # --- Removed Auto-Reset Arguments ---
+    # parser.add_argument('--auto-reset', action='store_true', ...)
+    # parser.add_argument('--reset-patience', type=int, default=5, ...)
+    # parser.add_argument('--reset-value', type=float, default=0.7, ...)
+    # parser.add_argument('--reset-threshold', type=float, default=0.5, ...)
 
     args = parser.parse_args()
 
+    # --- Determine Runtime Settings ---
     DO_TRAINING = (args.mode == 'train')
     RENDER_GAME = (not DO_TRAINING) or args.render_train
     NUM_EPISODES_ARG = args.episodes if DO_TRAINING else args.play_episodes
     AGENT_STATE_FILENAME = args.qtable
     MAX_STEPS = args.max_steps
-
     LOAD_AGENT_STATE = not args.fresh
 
-    auto_reset_params = None
-    if DO_TRAINING and args.auto_reset:
-        auto_reset_params = {
-            'patience': args.reset_patience,
-            'value': max(0.01, min(1.0, args.reset_value)),
-            'threshold': args.reset_threshold
-        }
-        if args.reset_epsilon is not None:
-            print("Info: --reset-epsilon is set manually. Auto-reset logic will still activate later based on performance if enabled.")
+    # --- Configure Auto-Reset (Now implicit in run_game) ---
+    # auto_reset_params = None # Removed
 
+    # --- File Existence Checks and User Feedback ---
     if args.mode == 'run' and not os.path.exists(AGENT_STATE_FILENAME):
         print(f"Error: Cannot run. Agent state file '{AGENT_STATE_FILENAME}' not found.")
         print("Please train the agent first ('python aisnake.py train') or specify the correct file with --qtable.")
@@ -565,6 +578,7 @@ if __name__ == '__main__':
         print("Starting fresh training.")
         LOAD_AGENT_STATE = False
 
+    # --- Agent Initialization ---
     print("-" * 30)
     agent_load_msg = ""
     if DO_TRAINING:
@@ -575,10 +589,11 @@ if __name__ == '__main__':
          agent_load_msg = f"Loading agent state from '{AGENT_STATE_FILENAME}' for run."
     print(agent_load_msg)
 
+    # Agent now implicitly uses initial_epsilon=1.0 for resets unless overridden by loading
     agent = QLearningAgent(
         learning_rate=0.1,
         discount_factor=0.9,
-        exploration_rate=1.0,
+        exploration_rate=1.0, # Default initial epsilon, used for resets
         exploration_decay=0.9995,
         min_exploration_rate=0.01,
         q_table_file=AGENT_STATE_FILENAME
@@ -586,25 +601,28 @@ if __name__ == '__main__':
     print("-" * 30)
 
 
-    if DO_TRAINING and args.reset_epsilon is not None:
+    # Apply manual epsilon reset AFTER agent initialization (overrides loaded/default start)
+    if args.reset_epsilon is not None: # Apply if training or running
          manual_eps_val = max(agent.min_epsilon, min(1.0, args.reset_epsilon))
          print(f"!!! MANUALLY Setting starting Epsilon to: {manual_eps_val:.4f} (overrides loaded/default) !!!")
          agent.epsilon = manual_eps_val
 
 
+    # --- Execute Game Loop ---
     session_start_time = time.time()
     session_high_score_final = 0
     session_scores = []
     e_type = None
 
     try:
+        # Call run_game WITHOUT auto_reset_config
         session_scores, session_high_score_final = run_game(
             agent,
             train=DO_TRAINING,
             num_episodes=NUM_EPISODES_ARG,
             render=RENDER_GAME,
-            max_steps_per_episode=MAX_STEPS,
-            auto_reset_config=auto_reset_params
+            max_steps_per_episode=MAX_STEPS
+            # No auto_reset_config here
         )
     except KeyboardInterrupt:
         print(f"\n{args.mode.capitalize()} interrupted by user (Ctrl+C).")
