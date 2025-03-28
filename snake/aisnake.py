@@ -548,12 +548,6 @@ if __name__ == '__main__':
     parser.add_argument('--reset-epsilon', type=float, default=None,
                         help="Manually force epsilon to this value AFTER loading state. Applied at the start.")
 
-    # --- Removed Auto-Reset Arguments ---
-    # parser.add_argument('--auto-reset', action='store_true', ...)
-    # parser.add_argument('--reset-patience', type=int, default=5, ...)
-    # parser.add_argument('--reset-value', type=float, default=0.7, ...)
-    # parser.add_argument('--reset-threshold', type=float, default=0.5, ...)
-
     args = parser.parse_args()
 
     # --- Determine Runtime Settings ---
@@ -563,9 +557,6 @@ if __name__ == '__main__':
     AGENT_STATE_FILENAME = args.qtable
     MAX_STEPS = args.max_steps
     LOAD_AGENT_STATE = not args.fresh
-
-    # --- Configure Auto-Reset (Now implicit in run_game) ---
-    # auto_reset_params = None # Removed
 
     # --- File Existence Checks and User Feedback ---
     if args.mode == 'run' and not os.path.exists(AGENT_STATE_FILENAME):
