@@ -720,7 +720,7 @@ def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_
 if __name__ == '__main__':
     DEFAULT_RESET_PATIENCE = 10 # Default patience for auto-reset
     DEFAULT_RESET_VALUE = 0.6   # Default reset epsilon value
-
+    print("Hi. It works")
     parser = argparse.ArgumentParser(description="Train or Run a Q-Learning Tetris AI.")
     parser.add_argument('mode', metavar='MODE', type=str, nargs='?', choices=['train', 'run'], default='run', help="Operation mode: 'train' or 'run'.")
     # --- Adjusted default episodes ---
