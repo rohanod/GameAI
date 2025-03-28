@@ -8,461 +8,786 @@ import os
 import time
 import traceback
 import argparse
-import copy # Needed for deep copies of board states
+import copy
 
-# --- Game Constants ---
-WIDTH, HEIGHT = 300, 600
-GRID_WIDTH, GRID_HEIGHT = 10, 20
-BLOCK_SIZE = HEIGHT // GRID_HEIGHT
-TOP_MARGIN = 50
-WINDOW_WIDTH = GRID_WIDTH * BLOCK_SIZE
-WINDOW_HEIGHT = GRID_HEIGHT * BLOCK_SIZE + TOP_MARGIN
+# --- Constants ---
+SCREEN_WIDTH, SCREEN_HEIGHT = 500, 600
+PLAYFIELD_WIDTH_PX, PLAYFIELD_HEIGHT_PX = 300, 600 # Area where pieces fall
+BLOCK_SIZE = 30
+GRID_WIDTH = PLAYFIELD_WIDTH_PX // BLOCK_SIZE # Usually 10 for Tetris
+GRID_HEIGHT = PLAYFIELD_HEIGHT_PX // BLOCK_SIZE # Usually 20 for Tetris
 
-INITIAL_FALL_DELAY = 500; FAST_FALL_DELAY = 50; INPUT_DELAY = 100
+INFO_PANEL_WIDTH = SCREEN_WIDTH - PLAYFIELD_WIDTH_PX
 
-WHITE = (255, 255, 255); BLACK = (0, 0, 0); GRAY = (128, 128, 128)
-RED = (213, 50, 80); GREEN = (0, 200, 0); BLUE = (50, 80, 213)
-CYAN = (0, 255, 255); MAGENTA = (255, 0, 255); YELLOW = (255, 255, 0); ORANGE = (255, 165, 0)
-PIECE_COLORS = [GRAY, CYAN, YELLOW, MAGENTA, GREEN, RED, BLUE, ORANGE]
+# How fast the game runs in 'run' mode (lower is slower)
+PLAY_SPEED_FPS = 5 # Frames per second when watching the AI play
 
-SHAPES = [
-    [[[0,0], [1,0], [2,0], [3,0]], [[0,0], [0,1], [0,2], [0,3]]], # I
-    [[[0,0], [0,1], [1,0], [1,1]]], # O
-    [[[0,1], [1,0], [1,1], [1,2]], [[0,1], [1,1], [1,0], [2,1]], [[1,0], [1,1], [1,2], [2,1]], [[0,0], [1,0], [1,1], [2,0]]], # T
-    [[[0,1], [0,2], [1,0], [1,1]], [[0,0], [1,0], [1,1], [2,1]]], # S
-    [[[0,0], [0,1], [1,1], [1,2]], [[0,2], [1,1], [1,2], [2,1]]], # Z
-    [[[0,0], [1,0], [1,1], [1,2]], [[0,1], [0,2], [1,1], [2,1]], [[1,0], [1,1], [1,2], [2,2]], [[0,1], [1,1], [2,0], [2,1]]], # J
-    [[[0,2], [1,0], [1,1], [1,2]], [[0,1], [1,1], [2,1], [2,2]], [[1,0], [1,1], [1,2], [2,0]], [[0,0], [0,1], [1,1], [2,1]]]  # L
+# Colors
+WHITE = (255, 255, 255)
+BLACK = (0, 0, 0)
+GRAY = (128, 128, 128)
+GRID_COLOR = (40, 40, 40)
+
+# Tetromino Shapes (indices correspond to colors)
+TETROMINOES = {
+    'I': [(0, 1), (1, 1), (2, 1), (3, 1)],
+    'O': [(1, 0), (2, 0), (1, 1), (2, 1)],
+    'T': [(0, 1), (1, 1), (2, 1), (1, 0)],
+    'S': [(1, 0), (2, 0), (0, 1), (1, 1)],
+    'Z': [(0, 0), (1, 0), (1, 1), (2, 1)],
+    'J': [(0, 0), (0, 1), (1, 1), (2, 1)],
+    'L': [(2, 0), (0, 1), (1, 1), (2, 1)],
+}
+PIECE_COLORS = [
+    (0, 240, 240), # I (Cyan)
+    (240, 240, 0), # O (Yellow)
+    (160, 0, 240), # T (Purple)
+    (0, 240, 0),   # S (Green)
+    (240, 0, 0),   # Z (Red)
+    (0, 0, 240),   # J (Blue)
+    (240, 160, 0)  # L (Orange)
 ]
 
-# --- AI Constants --- (Strong Penalties + No Clear Streak + Eroded Cells)
-REWARD_LINE_CLEAR = [0, 100, 300, 700, 1500] # AI Reward for line clears
-REWARD_GAME_OVER = -1000
+# --- Rewards (Optimized Defaults) ---
+REWARD_LINE_CLEAR = [0, 100, 300, 500, 800] # Base rewards for 0, 1, 2, 3, 4 lines
+REWARD_PER_PIECE_PLACED = 0.1 # Small survival reward
+REWARD_GAME_OVER = -1000      # Significant penalty for losing
 
-REWARD_PER_PIECE = 0
-REWARD_STEP_PENALTY = -0.01
+# Heuristic Penalties (Increased magnitude)
+PENALTY_PER_HOLE = -8        # Increased penalty for each hole
+PENALTY_AGG_HEIGHT = -4      # Increased penalty based on sum of column heights
+PENALTY_BUMPINESS = -2       # Increased penalty for height differences
+PENALTY_MAX_HEIGHT = -1      # Added: Penalty based on the highest column
+PENALTY_PLACEMENT_HEIGHT_FACTOR = -0.1 # Added: Penalty factor for how high a piece lands
 
-# Drastically Increased Penalties applied when a piece locks
-REWARD_HOLE_PENALTY = -75        # VERY Strong hole penalty
-REWARD_BUMPINESS_PENALTY = -3    # Increased bumpiness penalty
-REWARD_AGG_HEIGHT_PENALTY = -5.0 # VERY Strong aggregate height penalty
-REWARD_MAX_HEIGHT_PENALTY = -10  # VERY Strong max height penalty
+# --- Helper Functions ---
+def rotate_point(cx, cy, angle_rad, point):
+    """Rotates a point around a center (cx, cy)."""
+    x, y = point
+    temp_x = x - cx
+    temp_y = y - cy
+    rotated_x = temp_x * np.cos(angle_rad) - temp_y * np.sin(angle_rad)
+    rotated_y = temp_x * np.sin(angle_rad) + temp_y * np.cos(angle_rad)
+    return round(rotated_x + cx), round(rotated_y + cy)
 
-# Penalty for placing pieces without clearing lines
-NO_CLEAR_STREAK_THRESHOLD = 10 # Apply penalty after this many consecutive non-clearing locks
-REWARD_NO_CLEAR_STREAK_PENALTY = -50 # Penalty value (tune this)
+# --- Game Classes ---
+class Piece:
+    def __init__(self, shape_name, start_x, start_y):
+        self.shape_name = shape_name
+        self.shape = TETROMINOES[shape_name]
+        self.color_index = list(TETROMINOES.keys()).index(shape_name)
+        self.color = PIECE_COLORS[self.color_index]
+        self.x = start_x # Grid coordinates
+        self.y = start_y # Grid coordinates
+        self.rotation = 0 # 0=0, 1=90, 2=180, 3=270 degrees clockwise
 
-# Reward for efficient line clears
-REWARD_ERODED_CELL_MULTIPLIER = 5 # Bonus per block of the placed piece that cleared a line (tune this)
+    def get_block_positions(self, x_offset=0, y_offset=0, rotation_override=None):
+        """Returns the absolute grid positions of the piece's blocks."""
+        positions = []
+        current_rotation = rotation_override if rotation_override is not None else self.rotation
+        angle_rad = np.radians(current_rotation * 90)
+        cx, cy = (1.5, 1.5)
+        if self.shape_name == 'I': cx, cy = (1.5, 1.5)
+        elif self.shape_name == 'O': cx, cy = (1.5, 0.5)
 
-REWARD_ROW_PROGRESS_FACTOR = 0 # Intermediate reward disabled
+        for block in self.shape:
+            bx, by = block
+            if self.shape_name != 'O':
+                rotated_bx, rotated_by = rotate_point(cx, cy, angle_rad, (bx, by))
+            else:
+                rotated_bx, rotated_by = bx, by
+            positions.append((self.x + rotated_bx + x_offset, self.y + rotated_by + y_offset))
+        return positions
 
-# Actions
-ACTION_LEFT = 0; ACTION_RIGHT = 1; ACTION_ROTATE = 2; ACTION_NONE = 3; NUM_ACTIONS = 4
+    def rotate(self, clockwise=True):
+        """Updates the piece's rotation state."""
+        if self.shape_name == 'O': return
+        if clockwise:
+            self.rotation = (self.rotation + 1) % 4
+        else:
+            self.rotation = (self.rotation - 1 + 4) % 4
 
-class Tetromino:
-    def __init__(self, shape_index, grid_width):
-        self.shape_index = shape_index; self.shapes = SHAPES[shape_index]; self.rotation = 0
-        self.color_index = shape_index + 1; self.x = grid_width // 2 - 1; self.y = 0
-    def get_blocks(self): return [(self.y + r, self.x + c) for r, c in self.shapes[self.rotation]]
-    def rotate(self): self.rotation = (self.rotation + 1) % len(self.shapes)
-    def unrotate(self): self.rotation = (self.rotation - 1) % len(self.shapes)
-    def move(self, dx, dy): self.x += dx; self.y += dy
+    def move(self, dx, dy):
+        """Updates the piece's position."""
+        self.x += dx
+        self.y += dy
 
 class TetrisGame:
     def __init__(self):
-        self.grid_width = GRID_WIDTH; self.grid_height = GRID_HEIGHT; self.reset()
+        self.reset()
 
     def reset(self):
-        self.board = np.zeros((self.grid_height, self.grid_width), dtype=int); self.score = 0
-        self.lines_cleared_total = 0; self.game_over = False; self.current_piece = self._new_piece()
-        self.next_piece = self._new_piece(); self.fall_time = 0; self.fall_delay = INITIAL_FALL_DELAY
-        self.last_input_time = 0
-        self.no_clear_streak = 0 # Initialize the streak counter
-        return self._get_game_state()
+        self.well = [[0 for _ in range(GRID_WIDTH)] for _ in range(GRID_HEIGHT)]
+        self.score = 0
+        self.lines_cleared = 0
+        self.game_over = False
+        self.current_piece = None
+        self.next_piece_shape = random.choice(list(TETROMINOES.keys()))
+        self._new_piece()
 
-    def _new_piece(self): return Tetromino(random.randint(0, len(SHAPES) - 1), self.grid_width)
+    def _new_piece(self):
+        """Creates a new falling piece."""
+        if self.game_over: return
 
-    def _is_valid_position(self, piece=None):
-        p = piece or self.current_piece; blocks = p.get_blocks()
-        for r, c in blocks:
-            if not (0 <= c < self.grid_width and 0 <= r < self.grid_height): return False
-            if r >= 0 and self.board[r, c] != 0: return False
+        self.current_piece = Piece(self.next_piece_shape,
+                                   start_x=GRID_WIDTH // 2 - 2,
+                                   start_y=0)
+        self.next_piece_shape = random.choice(list(TETROMINOES.keys()))
+
+        if not self._is_valid_position(self.current_piece):
+            self.game_over = True
+            self.current_piece = None
+
+    def _is_valid_position(self, piece, x_offset=0, y_offset=0, rotation_override=None):
+        """Checks if piece placement is valid."""
+        if piece is None: return False
+
+        block_positions = piece.get_block_positions(x_offset, y_offset, rotation_override)
+
+        for x, y in block_positions:
+            if not (0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT):
+                return False
+            if y < 0: continue
+            if self.well[y][x] != 0:
+                return False
         return True
 
-    # Modified _clear_lines to return indices
+    def _place_piece(self):
+        """'Freezes' the current piece onto the well grid."""
+        if self.current_piece is None: return
+
+        block_positions = self.current_piece.get_block_positions()
+        color_val = self.current_piece.color_index + 1
+        for x, y in block_positions:
+            if 0 <= y < GRID_HEIGHT and 0 <= x < GRID_WIDTH:
+                self.well[y][x] = color_val
+            elif y < 0:
+                 self.game_over = True
+
+        if self.game_over:
+             self.current_piece = None
+
     def _clear_lines(self):
-        """Checks for and clears completed lines. Returns number cleared AND indices cleared."""
-        lines_to_clear = [r for r in range(self.grid_height) if np.all(self.board[r] != 0)]
+        """Checks for and clears completed lines, returns number cleared."""
+        lines_to_clear = []
+        for y in range(GRID_HEIGHT):
+            if all(self.well[y][x] != 0 for x in range(GRID_WIDTH)):
+                lines_to_clear.append(y)
+
         num_cleared = len(lines_to_clear)
         if num_cleared > 0:
-            self.board = np.delete(self.board, lines_to_clear, axis=0)
-            new_lines = np.zeros((num_cleared, self.grid_width), dtype=int)
-            self.board = np.vstack((new_lines, self.board))
-        return num_cleared, lines_to_clear # Return indices
+            self.lines_cleared += num_cleared
+            # Use the reward structure directly for score update
+            self.score += REWARD_LINE_CLEAR[num_cleared]
 
-    def _lock_piece(self):
-        # Store coordinates BEFORE locking
-        placed_piece_coords = self.current_piece.get_blocks()
+            lines_to_clear.sort(reverse=True)
+            for y_clear in lines_to_clear:
+                del self.well[y_clear]
+                self.well.insert(0, [0 for _ in range(GRID_WIDTH)])
 
-        piece_locked_y = -1
-        for r, c in placed_piece_coords: # Use stored coords
-            if 0 <= r < self.grid_height and 0 <= c < self.grid_width:
-                self.board[r, c] = self.current_piece.color_index
-                if r > piece_locked_y: piece_locked_y = r
-            else: pass
+        return num_cleared
 
-        # Game Over Check
-        spawn_blocked = False; test_piece_spawn = Tetromino(self.next_piece.shape_index, self.grid_width)
-        for r_offset, c_offset in test_piece_spawn.shapes[0]:
-            sr, sc = test_piece_spawn.y + r_offset, test_piece_spawn.x + c_offset
-            if 0 <= sr < self.grid_height and 0 <= sc < self.grid_width and self.board[sr, sc] != 0: spawn_blocked = True; break
-            elif sr < 0: pass
-        if piece_locked_y < 1 or spawn_blocked: self.game_over = True
+    # --- Removed manual movement/rotation attempts ---
+    # AI will directly choose and execute final placement via hard_drop
 
-        placement_reward = 0; lines_cleared = 0; no_clear_streak_penalty = 0; eroded_reward = 0
-        cleared_line_indices = []
+    def hard_drop_piece(self):
+        """Instantly drops the current piece to the lowest valid position and handles placement."""
+        lines_cleared = 0
+        landed = False
+        if self.current_piece and not self.game_over:
+            lowest_y = self.current_piece.y
+            while self._is_valid_position(self.current_piece, y_offset=(lowest_y - self.current_piece.y + 1)):
+                lowest_y += 1
 
-        if not self.game_over:
-            # Call modified _clear_lines
-            lines_cleared, cleared_line_indices = self._clear_lines()
+            dy = lowest_y - self.current_piece.y
+            # Optional: Add hard drop score bonus (separate from reward shaping for AI)
+            # if dy > 0: self.score += dy # Small score bonus per row dropped instantly
 
-            # Update No Clear Streak Counter & Penalty
-            if lines_cleared == 0:
-                self.no_clear_streak += 1
-                if self.no_clear_streak >= NO_CLEAR_STREAK_THRESHOLD:
-                    no_clear_streak_penalty = REWARD_NO_CLEAR_STREAK_PENALTY
-            else:
-                self.no_clear_streak = 0 # Reset streak
+            self.current_piece.move(0, dy)
 
-            # Calculate Eroded Piece Cells Reward
-            if lines_cleared > 0:
-                eroded_cells = 0
-                for r, c in placed_piece_coords: # Check original coords
-                    if r in cleared_line_indices: # Was this block in a cleared row?
-                         if 0 <= r < self.grid_height and 0 <= c < self.grid_width: # Bounds check
-                            eroded_cells += 1
-                eroded_reward = eroded_cells * REWARD_ERODED_CELL_MULTIPLIER
+            # Place piece, clear lines, get new piece
+            self._place_piece()
+            if self.game_over: return 0, True # Game over after placement
+            lines_cleared = self._clear_lines()
+            self._new_piece() # Get the next piece (also checks for game over)
+            landed = True
 
-            # Base Game Score Update
-            if lines_cleared == 1: self.score += 100
-            elif lines_cleared == 2: self.score += 300
-            elif lines_cleared == 3: self.score += 500
-            elif lines_cleared >= 4: self.score += 1200
-            self.lines_cleared_total += lines_cleared
+        return lines_cleared, landed or self.game_over
 
-            # AI Reward Calculation
-            board_features = self._calculate_board_features(self.board)
-            line_clear_bonus = REWARD_LINE_CLEAR[lines_cleared]
-            holes_penalty = board_features['holes'] * REWARD_HOLE_PENALTY
-            bumpiness_penalty = board_features['bumpiness'] * REWARD_BUMPINESS_PENALTY
-            agg_height_penalty = board_features['aggregate_height'] * REWARD_AGG_HEIGHT_PENALTY
-            max_height_penalty = board_features['max_height'] * REWARD_MAX_HEIGHT_PENALTY
+    # --- Removed step() as AI uses hard_drop ---
 
-            # Combine ALL reward components
-            placement_reward = (line_clear_bonus + REWARD_PER_PIECE +
-                                holes_penalty + bumpiness_penalty +
-                                agg_height_penalty + max_height_penalty +
-                                no_clear_streak_penalty +
-                                eroded_reward) # Add eroded reward
+    def get_board_features(self, well_state=None):
+        """Calculates features for the board state."""
+        target_well = well_state if well_state is not None else self.well
+        heights = [0] * GRID_WIDTH
+        for x in range(GRID_WIDTH):
+            for y in range(GRID_HEIGHT):
+                if target_well[y][x] != 0:
+                    heights[x] = GRID_HEIGHT - y
+                    break
+        agg_height = sum(heights)
+        holes = 0
+        for x in range(GRID_WIDTH):
+            block_found = False
+            for y in range(GRID_HEIGHT):
+                if target_well[y][x] != 0:
+                    block_found = True
+                elif block_found and target_well[y][x] == 0:
+                    holes += 1
+        bumpiness = 0
+        for x in range(GRID_WIDTH - 1):
+            bumpiness += abs(heights[x] - heights[x+1])
+        max_height = max(heights) if heights else 0
 
-            self.current_piece = self.next_piece; self.next_piece = self._new_piece()
-            if not self._is_valid_position(self.current_piece): self.game_over = True; placement_reward = REWARD_GAME_OVER
-
-        return placement_reward, self.game_over
-
-    def step(self, action):
-        if self.game_over: return self._get_game_state(), REWARD_GAME_OVER, self.game_over, self.score
-
-        moved_or_rotated = False
-        if action == ACTION_LEFT:
-            self.current_piece.move(-1, 0)
-            if not self._is_valid_position(): self.current_piece.move(1, 0)
-            else: moved_or_rotated = True
-        elif action == ACTION_RIGHT:
-            self.current_piece.move(1, 0)
-            if not self._is_valid_position(): self.current_piece.move(-1, 0)
-            else: moved_or_rotated = True
-        elif action == ACTION_ROTATE:
-            original_rot = self.current_piece.rotation; self.current_piece.rotate()
-            if not self._is_valid_position():
-                kicks = [(0, 0), (-1, 0), (1, 0), (-2, 0), (2, 0), (0, -1)]
-                kicked = False; current_x, current_y = self.current_piece.x, self.current_piece.y
-                for dx, dy in kicks:
-                    self.current_piece.move(dx, dy)
-                    if self._is_valid_position(): kicked = True; moved_or_rotated = True; break
-                    else: self.current_piece.move(-dx, -dy)
-                if not kicked: self.current_piece.x = current_x; self.current_piece.y = current_y; self.current_piece.rotation = original_rot
-            else: moved_or_rotated = True
-
-        self.current_piece.move(0, 1)
-        reward = REWARD_STEP_PENALTY
-
-        if not self._is_valid_position():
-            self.current_piece.move(0, -1)
-            placement_reward, game_over_after_lock = self._lock_piece()
-            self.game_over = game_over_after_lock
-            reward = REWARD_GAME_OVER if self.game_over else reward + placement_reward
-
-        current_score = self.score
-        return self._get_game_state(), reward, self.game_over, current_score
-
-    def _get_game_state(self):
-        return {"board": self.board.copy(), "current_piece": copy.deepcopy(self.current_piece), "game_over": self.game_over}
-
-    @staticmethod
-    def _calculate_board_features(board):
-        height, width = board.shape; heights = np.zeros(width, dtype=int)
-        for c in range(width):
-            filled = np.where(board[:, c] != 0)[0]; heights[c] = height - np.min(filled) if len(filled) > 0 else 0
-        agg_h = np.sum(heights); holes = 0; bump = 0
-        for c in range(width):
-            h = heights[c]
-            if h > 0: holes += np.sum(board[height - h:height, c] == 0)
-            if c < width - 1: bump += abs(heights[c] - heights[c+1])
-        max_h = np.max(heights) if np.any(heights) else 0
-        return {"heights": heights, "aggregate_height": agg_h, "holes": holes, "bumpiness": bump, "max_height": max_h}
+        # Return tuple: heights(10) + agg_height(1) + holes(1) + bumpiness(1) + max_height(1) = 14 features
+        return tuple(heights) + (agg_height, holes, bumpiness, max_height)
 
     def draw(self, surface, font):
+        """Draws the game state."""
         surface.fill(BLACK)
-        for r in range(self.grid_height): pygame.draw.line(surface, GRAY, (0, r*BLOCK_SIZE+TOP_MARGIN), (WINDOW_WIDTH, r*BLOCK_SIZE+TOP_MARGIN), 1)
-        for c in range(self.grid_width + 1): pygame.draw.line(surface, GRAY, (c*BLOCK_SIZE, TOP_MARGIN), (c*BLOCK_SIZE, WINDOW_HEIGHT), 1)
-        for r in range(self.grid_height):
-            for c in range(self.grid_width):
-                if self.board[r,c] != 0:
-                    color = PIECE_COLORS[self.board[r,c]%len(PIECE_COLORS)]; pygame.draw.rect(surface, color, (c*BLOCK_SIZE+1, r*BLOCK_SIZE+TOP_MARGIN+1, BLOCK_SIZE-2, BLOCK_SIZE-2))
+
+        # Draw Playfield
+        for y in range(GRID_HEIGHT):
+            for x in range(GRID_WIDTH):
+                color_val = self.well[y][x]
+                rect = pygame.Rect(x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
+                if color_val == 0:
+                    pygame.draw.rect(surface, BLACK, rect)
+                    pygame.draw.rect(surface, GRID_COLOR, rect, 1)
+                else:
+                    pygame.draw.rect(surface, PIECE_COLORS[color_val - 1], rect)
+                    pygame.draw.rect(surface, BLACK, rect, 1)
+
+        # Draw Current Piece
         if self.current_piece and not self.game_over:
-            color = PIECE_COLORS[self.current_piece.color_index%len(PIECE_COLORS)]
-            for r, c in self.current_piece.get_blocks():
-                 if r >= 0: pygame.draw.rect(surface, color, (c*BLOCK_SIZE+1, r*BLOCK_SIZE+TOP_MARGIN+1, BLOCK_SIZE-2, BLOCK_SIZE-2))
-        pygame.draw.rect(surface, WHITE, (0, TOP_MARGIN, WINDOW_WIDTH, WINDOW_HEIGHT - TOP_MARGIN), 2)
+            block_positions = self.current_piece.get_block_positions()
+            for x, y in block_positions:
+                if y >= 0:
+                   rect = pygame.Rect(x * BLOCK_SIZE, y * BLOCK_SIZE, BLOCK_SIZE, BLOCK_SIZE)
+                   pygame.draw.rect(surface, self.current_piece.color, rect)
+                   pygame.draw.rect(surface, WHITE, rect, 1)
+
+        # Draw Info Panel
+        info_x_start = PLAYFIELD_WIDTH_PX + 10
         if font:
-            scr_txt=font.render(f"Score:{self.score}",1,WHITE); lin_txt=font.render(f"Lines:{self.lines_cleared_total}",1,WHITE); surface.blit(scr_txt,(5,5)); surface.blit(lin_txt,(5,25))
-        if self.game_over and font:
-            ovr_fnt=pygame.font.SysFont(None, 50); ovr_txt=ovr_fnt.render("GAME OVER", 1, RED); ovr_rct=ovr_txt.get_rect(center=(WINDOW_WIDTH//2, WINDOW_HEIGHT//2)); surface.blit(ovr_txt,ovr_rct)
+            score_text = font.render(f"Score: {self.score}", True, WHITE)
+            surface.blit(score_text, (info_x_start, 10))
+            lines_text = font.render(f"Lines: {self.lines_cleared}", True, WHITE)
+            surface.blit(lines_text, (info_x_start, 40))
+            next_label = font.render("Next:", True, WHITE)
+            surface.blit(next_label, (info_x_start, 80))
+            if self.next_piece_shape:
+                next_p = Piece(self.next_piece_shape, 0, 0)
+                next_blocks = next_p.get_block_positions()
+                min_x = min(b[0] for b in next_blocks); min_y = min(b[1] for b in next_blocks)
+                max_w = max(b[0] for b in next_blocks) - min_x + 1
+                # Center the next piece preview horizontally
+                preview_base_x = info_x_start + (INFO_PANEL_WIDTH - max_w*BLOCK_SIZE) // 2 - min_x*BLOCK_SIZE
+                for x, y in next_blocks:
+                    draw_x = preview_base_x + (x) * BLOCK_SIZE # Use absolute block x directly
+                    draw_y = 110 + (y - min_y) * BLOCK_SIZE
+                    rect = pygame.Rect(draw_x, draw_y, BLOCK_SIZE, BLOCK_SIZE)
+                    pygame.draw.rect(surface, next_p.color, rect)
+                    pygame.draw.rect(surface, BLACK, rect, 1)
 
-# --- Q-Learning Agent ---
+        # Draw Game Over
+        if self.game_over:
+             try:
+                font_large = pygame.font.SysFont(None, 72)
+                over_text = font_large.render("GAME OVER", True, (255, 0, 0))
+                text_rect = over_text.get_rect(center=(PLAYFIELD_WIDTH_PX // 2, PLAYFIELD_HEIGHT_PX // 2))
+                surface.blit(over_text, text_rect)
+             except Exception: pass # Ignore font errors here
+
 class QLearningAgent:
-    def __init__(self, learning_rate=0.1, discount_factor=0.95, exploration_rate=1.0,
-                 exploration_decay=0.9999, min_exploration_rate=0.01, q_table_file='tetris.pkl'):
-        self.lr = learning_rate; self.gamma = discount_factor; self.initial_epsilon = exploration_rate
-        self.epsilon = exploration_rate; self.epsilon_decay = exploration_decay; self.min_epsilon = min_exploration_rate
-        self.q_table_file = q_table_file; self.actions = list(range(NUM_ACTIONS)); self.num_actions = NUM_ACTIONS
-        dummy_game = TetrisGame(); dummy_state_info = dummy_game._get_game_state()
-        try: self.current_state_tuple_len = len(self.get_state(dummy_state_info))
-        except Exception: self.current_state_tuple_len = 7 # Fallback
-        self.q_table = self.load_q_table()
+    # --- Helper Class within Agent for simulation ---
+    class MockGame:
+         def __init__(self, well): self.well = well
+         def _is_valid_position(self, piece, x_offset=0, y_offset=0, rotation_override=None):
+             block_positions = piece.get_block_positions(x_offset, y_offset, rotation_override)
+             for x, y in block_positions:
+                 if not (0 <= x < GRID_WIDTH and 0 <= y < GRID_HEIGHT): return False
+                 if y < 0: continue
+                 if self.well[y][x] != 0: return False
+             return True
+         # Add get_board_features to MockGame for convenience in learn()
+         def get_board_features(self, well_state_arg):
+              # Use the main game's feature calculation method (static-like call)
+              # Requires access to an instance or making the method static - let's pass an instance
+              # Or simply call the global function if we refactor get_board_features
+              # Simpler: Create a temporary TetrisGame instance here just for the call
+              temp_game = TetrisGame()
+              features = temp_game.get_board_features(well_state_arg)
+              temp_game = None
+              return features
 
-    def load_q_table(self):
+
+    # --- Updated Defaults ---
+    def __init__(self, learning_rate=0.02, discount_factor=0.98, exploration_rate=1.0,
+                 exploration_decay=0.99995, min_exploration_rate=0.05, q_table_file='tetris.pkl'):
+        self.lr = learning_rate
+        self.gamma = discount_factor
+        self.epsilon = exploration_rate
+        self.initial_epsilon = exploration_rate
+        self.epsilon_decay = exploration_decay
+        self.min_epsilon = min_exploration_rate
+        self.q_table_file = q_table_file
+
+        # State features: heights(10) + agg_h(1) + holes(1) + bump(1) + max_h(1) = 14
+        self.state_value_table = defaultdict(lambda: 0.0) # Use V(s) approach
+
+        # Determine state length dynamically based on current feature func
+        dummy_game = TetrisGame()
+        self.current_state_len = len(dummy_game.get_board_features())
+        print(f"State representation length: {self.current_state_len}")
+        dummy_game = None # Release dummy game
+
+        # Load saved table (passing self.current_state_len for check)
+        self.state_value_table = self.load_value_table(self.current_state_len)
+
+    def load_value_table(self, expected_len):
+        """Loads the state value table V(s)."""
         if os.path.exists(self.q_table_file):
             try:
-                with open(self.q_table_file, 'rb') as f: saved_data = pickle.load(f)
-                if isinstance(saved_data, dict) and 'q_table' in saved_data and 'epsilon' in saved_data:
-                    q_table_loaded, loaded_epsilon = saved_data['q_table'], saved_data['epsilon']
-                    print(f"Loaded '{self.q_table_file}' ({len(q_table_loaded)} states, Eps {loaded_epsilon:.4f}).")
-                    self.epsilon = loaded_epsilon
-                else: q_table_loaded = saved_data; print(f"Loaded old format '{self.q_table_file}'. Reset eps."); self.epsilon = self.initial_epsilon
+                with open(self.q_table_file, 'rb') as f:
+                    saved_data = pickle.load(f)
+                if isinstance(saved_data, dict) and 'value_table' in saved_data and 'epsilon' in saved_data:
+                    value_table_loaded = saved_data['value_table']
+                    loaded_epsilon = saved_data['epsilon']
+                    print(f"Loading agent state from '{self.q_table_file}'...")
+                    self.epsilon = max(self.min_epsilon, min(1.0, loaded_epsilon))
+                    print(f" - Loaded Epsilon: {self.epsilon:.4f}")
 
-                q_table = defaultdict(lambda: np.zeros(self.num_actions)); valid, invalid = 0, 0
-                for state, values in q_table_loaded.items():
-                    q_vals = np.zeros(self.num_actions)
-                    if isinstance(values, (list, np.ndarray)) and len(values) == self.num_actions: q_vals = np.array(values)
-                    elif isinstance(values, np.ndarray) and values.shape == (self.num_actions,): q_vals = values
-                    if isinstance(state, tuple) and len(state) == self.current_state_tuple_len: q_table[state] = q_vals; valid += 1
-                    else: invalid += 1
-                if invalid > 0: print(f"Warn: Discarded {invalid} states (fmt mismatch). Kept {valid}.")
-                return q_table
-            except Exception as e: print(f"Error load '{self.q_table_file}': {e}. Start fresh."); self.epsilon = self.initial_epsilon; return defaultdict(lambda: np.zeros(self.num_actions))
-        else: print(f"'{self.q_table_file}' not found. Start fresh."); self.epsilon = self.initial_epsilon; return defaultdict(lambda: np.zeros(self.num_actions))
+                    value_table = defaultdict(lambda: 0.0)
+                    valid_states = 0; invalid_states = 0
+                    first_state = next(iter(value_table_loaded), None)
+                    loaded_len = len(first_state) if isinstance(first_state, tuple) else -1
+
+                    if first_state is not None and loaded_len != expected_len:
+                         print(f"!! State length mismatch! Loaded: {loaded_len}, Expected: {expected_len}. Discarding. !!")
+                         self.epsilon = self.initial_epsilon
+                         return defaultdict(lambda: 0.0)
+
+                    print(f" - State length matches ({expected_len}). Loading values.")
+                    for state, value in value_table_loaded.items():
+                        if isinstance(state, tuple) and len(state) == expected_len and isinstance(value, (float, int, np.number)):
+                            value_table[state] = float(value)
+                            valid_states += 1
+                        else: invalid_states += 1
+                    print(f" - Loaded States: {len(value_table_loaded)}, Kept: {valid_states}, Discarded: {invalid_states}")
+                    if valid_states == 0 and len(value_table_loaded) > 0: self.epsilon = self.initial_epsilon
+                    return value_table
+                else:
+                    print(f"Warning: Unknown format in '{self.q_table_file}'. Starting fresh.")
+                    self.epsilon = self.initial_epsilon; return defaultdict(lambda: 0.0)
+            except Exception as e:
+                print(f"Error loading '{self.q_table_file}': {e}. Starting fresh."); self.epsilon = self.initial_epsilon; return defaultdict(lambda: 0.0)
+        else:
+            print(f"Agent file '{self.q_table_file}' not found. Starting fresh."); self.epsilon = self.initial_epsilon; return defaultdict(lambda: 0.0)
 
     def save_q_table(self):
+        """Saves the state value table V(s) and epsilon."""
         try:
-            with open(self.q_table_file, 'wb') as f: pickle.dump({'q_table': dict(self.q_table), 'epsilon': self.epsilon}, f)
-        except Exception as e: print(f"Error save '{self.q_table_file}': {e}")
+            data_to_save = {'value_table': dict(self.state_value_table), 'epsilon': self.epsilon}
+            with open(self.q_table_file, 'wb') as f: pickle.dump(data_to_save, f)
+        except Exception as e: print(f"Error saving data to '{self.q_table_file}': {e}")
 
-    def get_state(self, game_state_info):
-        board = game_state_info["board"]; piece = game_state_info["current_piece"]
-        if piece is None: return (0,) * self.current_state_tuple_len
-        features = TetrisGame._calculate_board_features(board)
-        state = (int(features['aggregate_height'] // 15), int(features['holes']), int(features['bumpiness'] // 4), int(features['max_height'] // 3),
-                 piece.shape_index, piece.rotation, piece.x)
-        if len(state) != self.current_state_tuple_len: print("CRITICAL WARN: State len mismatch!"); state = state[:self.current_state_tuple_len] + (0,) * (self.current_state_tuple_len - len(state))
-        return state
+    def get_state(self, game):
+        """Returns the feature tuple for the current game state."""
+        return game.get_board_features()
 
-    def choose_action(self, state):
-        if random.random() < self.epsilon: return random.choice(self.actions)
+    def _calculate_placement_outcome(self, game, piece, rotation, x_pos):
+        """Simulates placing the piece, returns (resulting_well, lines_cleared, resulting_features, is_valid, landing_y)."""
+        if piece is None: return None, 0, None, False, -1
+
+        hypothetical_piece = copy.deepcopy(piece)
+        hypothetical_piece.rotation = rotation
+        hypothetical_piece.x = x_pos
+        hypothetical_piece.y = 0 # Start high
+
+        # Ensure valid start, adjusting y if needed (for I piece etc.)
+        initial_y = 0
+        while not game._is_valid_position(hypothetical_piece, y_offset=initial_y - hypothetical_piece.y) and initial_y > -3:
+             initial_y -= 1
+        hypothetical_piece.y = initial_y
+        if not game._is_valid_position(hypothetical_piece): return None, 0, None, False, -1 # Invalid spawn
+
+        # Simulate hard drop
+        landing_y = hypothetical_piece.y
+        while game._is_valid_position(hypothetical_piece, y_offset=(landing_y - hypothetical_piece.y + 1)):
+            landing_y += 1
+        hypothetical_piece.y = landing_y
+
+        if not game._is_valid_position(hypothetical_piece): return None, 0, None, False, landing_y
+
+        # Simulate placing on a copy of the well
+        temp_well = [row[:] for row in game.well]
+        block_positions = hypothetical_piece.get_block_positions()
+        color_val = hypothetical_piece.color_index + 1
+        placed_above_screen = False
+        min_block_y = GRID_HEIGHT # Track highest placed block y (lowest value)
+
+        for x, y in block_positions:
+            if 0 <= y < GRID_HEIGHT and 0 <= x < GRID_WIDTH:
+                temp_well[y][x] = color_val
+                min_block_y = min(min_block_y, y)
+            elif y < 0: placed_above_screen = True; break
+
+        if placed_above_screen:
+            features = game.get_board_features(temp_well) # Features might be weird
+            return temp_well, 0, features, True, landing_y # Valid placement, but bad outcome
+
+        # Simulate clearing lines
+        lines_cleared = 0
+        rows_to_clear = []
+        for y in range(GRID_HEIGHT):
+            if all(temp_well[y][x] != 0 for x in range(GRID_WIDTH)): rows_to_clear.append(y)
+        lines_cleared = len(rows_to_clear)
+        if lines_cleared > 0:
+            rows_to_clear.sort(reverse=True)
+            for y_clear in rows_to_clear: del temp_well[y_clear]; temp_well.insert(0, [0]*GRID_WIDTH)
+
+        resulting_features = game.get_board_features(temp_well)
+        return temp_well, lines_cleared, resulting_features, True, landing_y
+
+
+    def choose_action(self, game):
+        """Evaluates placements, returns best (target_rotation, target_x_pos)."""
+        if game.current_piece is None or game.game_over: return None
+
+        possible_placements = [] # (rotation, x_pos, desirability, features_after)
+        current_piece = game.current_piece
+
+        for rot in range(4):
+            test_piece = Piece(current_piece.shape_name, 0, 0)
+            blocks = test_piece.get_block_positions(rotation_override=rot)
+            if not blocks: continue # Should not happen
+            min_block_x = min(b[0] for b in blocks); max_block_x = max(b[0] for b in blocks)
+
+            for x_pos in range(0 - min_block_x, GRID_WIDTH - max_block_x):
+                well_after, lines_cleared, features_after, is_valid, landing_y = \
+                    self._calculate_placement_outcome(game, current_piece, rot, x_pos)
+
+                if is_valid:
+                    immediate_reward = REWARD_LINE_CLEAR[lines_cleared] + REWARD_PER_PIECE_PLACED
+
+                    # Heuristic penalties based on features_after
+                    # features_after = (heights..., agg_h, holes, bumpiness, max_h) - len=14
+                    agg_height = features_after[GRID_WIDTH]
+                    holes = features_after[GRID_WIDTH + 1]
+                    bumpiness = features_after[GRID_WIDTH + 2]
+                    max_height = features_after[GRID_WIDTH + 3]
+
+                    # Placement height penalty (based on where the piece lands)
+                    placement_height_penalty = (GRID_HEIGHT - landing_y) * abs(PENALTY_PLACEMENT_HEIGHT_FACTOR)
+
+                    heuristic_penalty = (holes * abs(PENALTY_PER_HOLE) +
+                                        agg_height * abs(PENALTY_AGG_HEIGHT) +
+                                        bumpiness * abs(PENALTY_BUMPINESS) +
+                                        max_height * abs(PENALTY_MAX_HEIGHT) +
+                                        placement_height_penalty)
+
+                    game_over_penalty = 0
+                    if any(well_after[0][x] != 0 for x in range(GRID_WIDTH)):
+                         game_over_penalty = abs(REWARD_GAME_OVER) * 1.5 # Heavy penalty
+
+                    estimated_future_value = self.state_value_table[features_after]
+
+                    desirability = (immediate_reward + self.gamma * estimated_future_value -
+                                    heuristic_penalty - game_over_penalty)
+
+                    possible_placements.append((rot, x_pos, desirability, features_after))
+
+        if not possible_placements: return (current_piece.rotation, current_piece.x) # Fallback
+
+        # Epsilon-greedy selection
+        if random.random() < self.epsilon:
+            chosen_placement_data = random.choice(possible_placements)
         else:
-            q_values = self.q_table[state]
-            if np.all(q_values == 0): return random.choice(self.actions)
-            else: return random.choice(np.where(q_values == np.max(q_values))[0])
+            possible_placements.sort(key=lambda x: x[2], reverse=True)
+            chosen_placement_data = possible_placements[0]
 
-    def learn(self, state, action, reward, next_state, game_over):
-        current_q = self.q_table[state][action]
-        target_q = reward if game_over else reward + self.gamma * np.max(self.q_table[next_state])
-        self.q_table[state][action] = current_q + self.lr * (target_q - current_q)
+        return (chosen_placement_data[0], chosen_placement_data[1])
+
+    def learn(self, state_features_before, reward_received, state_features_after, next_piece_info):
+        """Update V(s_before) using TD learning."""
+        current_value = self.state_value_table[state_features_before]
+
+        # Find max V(s'') achievable from state_features_after with next_piece
+        max_future_value = 0.0
+        if next_piece_info is not None:
+            next_piece_shape = next_piece_info['shape']
+            well_state_after = next_piece_info['well'] # Well corresponding to state_features_after
+            mock_game = self.MockGame(well_state_after) # Use helper class instance
+            next_piece_obj = Piece(next_piece_shape, 0, 0)
+
+            best_v_s_prime = -float('inf')
+            found_valid_next_placement = False
+
+            for rot in range(4):
+                test_piece = Piece(next_piece_shape, 0, 0)
+                blocks = test_piece.get_block_positions(rotation_override=rot)
+                if not blocks: continue
+                min_bx = min(b[0] for b in blocks); max_bx = max(b[0] for b in blocks)
+
+                for x_pos in range(0 - min_bx, GRID_WIDTH - max_bx):
+                    # Simulate outcome of placing the *next* piece using the mock game
+                    # Need to use _calculate_placement_outcome with the mock_game context
+                    # We only need features_s_prime and validity from this call
+                    _well_sp, _lines_sp, features_s_prime, is_valid_sp, _ly_sp = \
+                        self._calculate_placement_outcome(mock_game, next_piece_obj, rot, x_pos)
+
+                    if is_valid_sp:
+                        found_valid_next_placement = True
+                        best_v_s_prime = max(best_v_s_prime, self.state_value_table[features_s_prime])
+
+            # If no valid placements were found for the next piece (e.g., instant game over), future value is 0
+            if found_valid_next_placement:
+                 max_future_value = best_v_s_prime if best_v_s_prime > -float('inf') else 0.0
+
+        # TD Update: V(s) = V(s) + alpha * (Reward + gamma * max V(s') - V(s))
+        td_target = reward_received + self.gamma * max_future_value
+        new_value = current_value + self.lr * (td_target - current_value)
+        self.state_value_table[state_features_before] = new_value
 
     def decay_exploration(self):
-        if self.epsilon > self.min_epsilon: self.epsilon = max(self.min_epsilon, self.epsilon * self.epsilon_decay)
+        if self.epsilon > self.min_epsilon:
+            self.epsilon *= self.epsilon_decay
+            self.epsilon = max(self.min_epsilon, self.epsilon)
 
-# --- Main Game Loop ---
-def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_episode=20000):
-    pygame.init(); font = None
-    try: font = pygame.font.SysFont(None, 25)
-    except Exception as e: print(f"Warn: Font fail: {e}")
-    screen = None; clock = pygame.time.Clock()
-    if render: screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT)); pygame.display.set_caption('Tetris AI')
 
-    session_high_score = 0; scores = []; total_steps_log = 0; episode_start_times = deque(maxlen=100)
-    mode = "Train" if train else "Play"; render_stat = "Visible" if render else "Non-Visible"
-    print(f"\n--- Start {mode} ({render_stat}) ---"); print(f"Start Eps: {agent.epsilon:.4f}")
-    if train: print(f"Eps: {num_episodes}, Max Steps: {max_steps_per_episode}")
-    else: print("Policy (min explore)."); agent.epsilon = agent.min_epsilon
+# --- Game Loop Function ---
+def run_game(agent, train=False, num_episodes=1000, render=False, max_steps_per_episode=5000, auto_reset_config=None):
+    pygame.init()
+    screen = None; font = None; clock = None
 
-    # Variables for Auto-Reset
-    last_logged_avg_score = -np.inf
-    stagnation_counter = 0
-    STAGNATION_THRESHOLD = 3
+    if render:
+        try:
+            pygame.font.init(); font = pygame.font.SysFont(None, 30)
+        except Exception as e: print(f"Warning: Pygame font failed: {e}. Text disabled."); font = None
+        screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
+        pygame.display.set_caption('Q-Learning Tetris AI')
+        clock = pygame.time.Clock()
+
+    session_high_score = 0; scores = []; total_lines_session = 0; total_pieces_session_log = 0
+    mode = "Training" if train else "Playing"; render_status = "Visible" if render else "Non-Visible"
+    print(f"\n--- Starting {mode} ({render_status}) ---"); print(f"Start Epsilon: {agent.epsilon:.4f}")
+    if train: print(f"Episodes: {num_episodes}, Max Steps/Ep: {max_steps_per_episode}")
+    else: print("Using learned policy (minimal exploration)."); agent.epsilon = agent.min_epsilon
+
+    # Auto-reset setup
+    best_avg_score_so_far = -np.inf; stagnation_counter = 0; log_interval = 50
+    auto_reset_enabled = train and auto_reset_config is not None
+    if auto_reset_enabled: print(f"Auto Epsilon Reset: Patience={auto_reset_config['patience']}, Value={auto_reset_config['value']:.2f}")
 
     for episode in range(num_episodes):
-        ep_start = time.time(); game = TetrisGame(); state_info = game.reset(); state = agent.get_state(state_info)
-        game_over = False; steps = 0; ep_score = 0
+        game = TetrisGame(); steps_taken = 0; episode_over = False; last_state_features = None
 
-        while not game_over and steps < max_steps_per_episode:
-            pygame.event.pump()
-
+        while not episode_over and steps_taken < max_steps_per_episode:
             if render:
                 for event in pygame.event.get():
                     if event.type == pygame.QUIT:
-                        print("Quit. Save...")
-                        if train: agent.save_q_table()
+                        print("\nQuit signal.");
+                        if train: agent.save_q_table(); print("Agent saved.")
                         pygame.quit(); return scores, session_high_score
-                    if event.type == pygame.KEYDOWN:
-                        if event.key == pygame.K_r:
-                            agent.epsilon = agent.initial_epsilon
-                            print(f"\n*** Epsilon reset to {agent.epsilon:.4f} by user! ***\n")
-                            stagnation_counter = 0
-                            last_logged_avg_score = -np.inf
+                # No manual controls needed for AI play
 
-            action = agent.choose_action(state)
-            next_state_info, reward, game_over, current_score = game.step(action)
-            ep_score = current_score
+            if game.game_over:
+                episode_over = True
+                reward_for_learning = REWARD_GAME_OVER # Final penalty
+                if train and last_state_features is not None:
+                    # Learn from the state leading to game over (future value is 0)
+                    td_target = reward_for_learning
+                    current_value = agent.state_value_table[last_state_features]
+                    new_value = current_value + agent.lr * (td_target - current_value)
+                    agent.state_value_table[last_state_features] = new_value
+                continue
 
-            if train:
-                next_state = agent.get_state(next_state_info)
-                if state_info["current_piece"] is not None:
-                    agent.learn(state, action, reward, next_state, game_over)
+            # --- AI Decision & Execution ---
+            if game.current_piece:
+                state_features_before = agent.get_state(game)
+                last_state_features = state_features_before # Remember for learning
 
-            state_info = next_state_info; state = agent.get_state(state_info)
+                chosen_placement = agent.choose_action(game)
 
-            steps += 1
-            if train: total_steps_log += 1
+                if chosen_placement:
+                    target_rotation, target_x = chosen_placement
+                    original_piece = copy.deepcopy(game.current_piece) # Keep ref before drop
+
+                    # Simulate *before* executing to get expected features_after and landing_y
+                    well_after_sim, lines_sim, features_after_sim, is_valid_sim, landing_y_sim = \
+                         agent._calculate_placement_outcome(game, original_piece, target_rotation, target_x)
+
+                    # Execute the placement in the real game
+                    game.current_piece.rotation = target_rotation
+                    game.current_piece.x = target_x
+                    lines_cleared_actual, landed = game.hard_drop_piece() # Executes placement
+
+                    # Determine reward based on actual outcome + simulated penalties
+                    reward_for_learning = 0
+                    if game.game_over: # Check if hard_drop caused game over
+                        reward_for_learning = REWARD_GAME_OVER
+                        episode_over = True
+                    elif is_valid_sim: # If simulation was valid (should be if placement chosen)
+                        reward_for_learning = REWARD_LINE_CLEAR[lines_cleared_actual] + REWARD_PER_PIECE_PLACED
+
+                        # Calculate penalties based on the simulated outcome state (features_after_sim)
+                        agg_h_sim = features_after_sim[GRID_WIDTH]
+                        holes_sim = features_after_sim[GRID_WIDTH + 1]
+                        bump_sim = features_after_sim[GRID_WIDTH + 2]
+                        max_h_sim = features_after_sim[GRID_WIDTH + 3]
+                        placement_penalty_sim = (GRID_HEIGHT - landing_y_sim) * abs(PENALTY_PLACEMENT_HEIGHT_FACTOR)
+
+                        reward_for_learning += PENALTY_AGG_HEIGHT * agg_h_sim
+                        reward_for_learning += PENALTY_PER_HOLE * holes_sim
+                        reward_for_learning += PENALTY_BUMPINESS * bump_sim
+                        reward_for_learning += PENALTY_MAX_HEIGHT * max_h_sim
+                        reward_for_learning += placement_penalty_sim
+                    else:
+                         # Should not happen if choose_action returns valid placement
+                         print("Warning: Executed placement based on invalid simulation?")
+                         reward_for_learning = REWARD_GAME_OVER # Penalize heavily
+
+                    # Learn
+                    if train:
+                        next_piece_info = None
+                        if not game.game_over:
+                             next_piece_info = {'shape': game.next_piece_shape, 'well': game.well}
+                        # Use simulated features after for learning consistency
+                        agent.learn(state_features_before, reward_for_learning, features_after_sim, next_piece_info)
+
+                    steps_taken += 1
+                    if train: total_pieces_session_log += 1
+                else:
+                     # No valid placement found - should be rare, but maybe force game over
+                     print("Warning: No valid placement chosen by AI.")
+                     game.game_over = True # Treat as game over if AI cannot move
+                     episode_over = True
+
+            else: # Should not happen if game not over
+                 if not game.game_over: print("Warning: No current piece but game not over?"); time.sleep(0.1)
+
 
             if render:
-                game.draw(screen, font)
+                screen.fill(BLACK); game.draw(screen, font)
                 if font:
-                    ep_txt=font.render(f"E:{episode+1}/{num_episodes}",1,WHITE); eps_txt=font.render(f"Eps:{agent.epsilon:.4f}",1,WHITE); steps_txt=font.render(f"S:{steps}",1,WHITE)
-                    screen.blit(ep_txt,(WINDOW_WIDTH-150,5)); screen.blit(eps_txt,(WINDOW_WIDTH-150,25)); screen.blit(steps_txt,(WINDOW_WIDTH-150,45))
-                pygame.display.flip(); clock.tick(60)
+                     ep_text = font.render(f"Ep: {episode+1}/{num_episodes}", True, WHITE)
+                     eps_text = font.render(f"Eps: {agent.epsilon:.3f}", True, WHITE)
+                     screen.blit(ep_text, (PLAYFIELD_WIDTH_PX + 10, SCREEN_HEIGHT - 60))
+                     screen.blit(eps_text, (PLAYFIELD_WIDTH_PX + 10, SCREEN_HEIGHT - 30))
+                pygame.display.flip()
 
-        scores.append(ep_score); session_high_score = max(session_high_score, ep_score)
-        ep_end = time.time(); episode_start_times.append(ep_end - ep_start); avg_ep_time = np.mean(episode_start_times) if episode_start_times else 0
+                # --- Speed Control ---
+                if clock:
+                    if train: clock.tick(60) # Train with rendering runs faster
+                    else: clock.tick(PLAY_SPEED_FPS) # Run mode uses slower FPS
+
+        # --- Episode End ---
+        if game.score > session_high_score: session_high_score = game.score
+        scores.append(game.score); total_lines_session += game.lines_cleared
 
         if train:
             agent.decay_exploration()
-            log_interval = 100
-            # Auto-Reset Logic inside Logging Block
-            if (episode + 1) % log_interval == 0 or episode == num_episodes - 1:
-                if len(scores) > 0:
-                     current_avg_score = np.mean(scores[-log_interval:]) if len(scores)>=log_interval else np.mean(scores)
-                else:
-                     current_avg_score = 0
+            if (episode + 1) % log_interval == 0:
+                avg_score = np.mean(scores[-log_interval:]) if scores else 0
+                avg_lines = total_lines_session / log_interval if log_interval > 0 else 0
+                avg_pieces = total_pieces_session_log / log_interval if log_interval > 0 else 0
+                print_msg = f"Ep {episode + 1}/{num_episodes} | AvgScore({log_interval}): {avg_score:.0f} | AvgLines: {avg_lines:.1f} | AvgPieces: {avg_pieces:.1f} | High: {session_high_score} | Eps: {agent.epsilon:.4f} | States: {len(agent.state_value_table)}"
 
-                print(f"E {episode+1}/{num_episodes}|AvgS({log_interval}):{current_avg_score:.0f}|HiS:{session_high_score}|Eps:{agent.epsilon:.4f}|Steps:{total_steps_log}|T/Ep:{avg_ep_time:.2f}s", end="")
+                if auto_reset_enabled:
+                    if best_avg_score_so_far == -np.inf and (episode + 1) >= log_interval: best_avg_score_so_far = avg_score; print_msg += " | Init best avg."
+                    elif (episode + 1) > log_interval:
+                        improvement = avg_score - best_avg_score_so_far
+                        if improvement > 1.0: # Require minimal improvement
+                            print_msg += f" | New Best Avg! (+{improvement:.0f})"; best_avg_score_so_far = avg_score; stagnation_counter = 0
+                        else:
+                            stagnation_counter += 1; print_msg += f" | Stagnated ({stagnation_counter}/{auto_reset_config['patience']})"
+                            if stagnation_counter >= auto_reset_config['patience']:
+                                old_epsilon = agent.epsilon; agent.epsilon = max(agent.min_epsilon, auto_reset_config['value'])
+                                print_msg += f" | !!! AUTO-RESET Eps ({old_epsilon:.4f} -> {agent.epsilon:.4f}) !!!"; stagnation_counter = 0; best_avg_score_so_far = avg_score
+                print(print_msg); agent.save_q_table(); total_lines_session = 0; total_pieces_session_log = 0
 
-                if last_logged_avg_score > -np.inf:
-                    if current_avg_score <= last_logged_avg_score:
-                        stagnation_counter += 1
-                        print(f" (Stagnation: {stagnation_counter}/{STAGNATION_THRESHOLD})")
-                    else:
-                        stagnation_counter = 0
-                        last_logged_avg_score = current_avg_score
-                        print()
-                else:
-                    last_logged_avg_score = current_avg_score
-                    print(" (Initial Log)")
+        if not train: print(f"Game {episode+1} finished! Score: {game.score}, Lines: {game.lines_cleared}, Pieces: {steps_taken}")
+        if not train and render: time.sleep(1) # Pause briefly between games in run mode
 
-
-                if stagnation_counter >= STAGNATION_THRESHOLD:
-                    agent.epsilon = agent.initial_epsilon
-                    print(f"*** Stagnation detected! Epsilon reset to {agent.epsilon:.4f}. ***")
-                    stagnation_counter = 0
-                    last_logged_avg_score = current_avg_score
-
-
-                agent.save_q_table()
-                total_steps_log = 0
-            # End Auto-Reset Logic
-
-        elif render: print(f"G {episode+1} Over! Scr:{ep_score}, Lines:{game.lines_cleared_total}, Steps:{steps}")
-
-
-    if train: print("\n--- Train Finish ---"); agent.save_q_table()
+    # --- End of Run ---
+    if train: print("\n--- Training Finished ---"); agent.save_q_table(); print(f"Final agent state saved.")
     if render: pygame.quit()
     return scores, session_high_score
 
-# --- Main Execution ---
+
+# --- Main Execution Block ---
 if __name__ == '__main__':
+    DEFAULT_RESET_PATIENCE = 10 # Default patience for auto-reset
+    DEFAULT_RESET_VALUE = 0.6   # Default reset epsilon value
+
     parser = argparse.ArgumentParser(description="Train or Run a Q-Learning Tetris AI.")
-    parser.add_argument('mode', metavar='MODE', type=str, nargs='?', choices=['train', 'run'], default='run')
-    parser.add_argument('-e', '--episodes', type=int, default=50000)
-    parser.add_argument('-p', '--play-episodes', type=int, default=5)
-    parser.add_argument('--render-train', action='store_true')
-    parser.add_argument('--fresh', action='store_true')
-    parser.add_argument('--qtable', type=str, default="tetris.pkl")
-    parser.add_argument('--max-steps', type=int, default=20000)
-    parser.add_argument('--reset-epsilon', type=float, default=None) # Command-line reset option
-    parser.add_argument('--lr', type=float, default=0.05)
-    parser.add_argument('--gamma', type=float, default=0.95)
-    parser.add_argument('--decay', type=float, default=0.99995)
+    parser.add_argument('mode', metavar='MODE', type=str, nargs='?', choices=['train', 'run'], default='run', help="Operation mode: 'train' or 'run'.")
+    # --- Adjusted default episodes ---
+    parser.add_argument('-e', '--episodes', type=int, default=10000, help="Episodes for training (default: 10000).")
+    parser.add_argument('-p', '--play-episodes', type=int, default=5, help="Episodes to watch during 'run'.")
+    parser.add_argument('--render-train', action='store_true', help="Render during training (SLOW).")
+    parser.add_argument('--fresh', action='store_true', help="Force fresh training.")
+    parser.add_argument('--qtable', type=str, default="tetris.pkl", help="Agent state filename.")
+    parser.add_argument('--max-steps', type=int, default=3000, help="Max pieces per episode.")
+    parser.add_argument('--reset-epsilon', type=float, default=None, help="Manually set starting epsilon.")
+    parser.add_argument('--auto-reset', action='store_true', help="Enable auto epsilon reset during training.")
+    parser.add_argument('--reset-patience', type=int, default=DEFAULT_RESET_PATIENCE, help=f"Auto-Reset patience intervals (default: {DEFAULT_RESET_PATIENCE}).")
+    parser.add_argument('--reset-value', type=float, default=DEFAULT_RESET_VALUE, help=f"Auto-Reset epsilon value (default: {DEFAULT_RESET_VALUE}).")
+
     args = parser.parse_args()
 
-    DO_TRAINING=(args.mode=='train'); RENDER_GAME=(args.mode=='run') or args.render_train
-    NUM_EPISODES=args.episodes if DO_TRAINING else args.play_episodes; LOAD_STATE= not args.fresh
-    AGENT_FILE=args.qtable; MAX_STEPS=args.max_steps; file_exists=os.path.exists(AGENT_FILE)
+    DO_TRAINING = (args.mode == 'train')
+    RENDER_GAME = (not DO_TRAINING) or args.render_train # Render if 'run' or if 'train --render-train'
+    NUM_EPISODES_ARG = args.episodes if DO_TRAINING else args.play_episodes
+    AGENT_STATE_FILENAME = args.qtable
+    MAX_STEPS = args.max_steps
+    LOAD_AGENT_STATE = not args.fresh
 
-    if args.mode=='run' and not file_exists: print(f"Error: Cannot run. '{AGENT_FILE}' not found."); exit(1)
-    if DO_TRAINING and LOAD_STATE and not file_exists: print(f"Warn: Load requested but '{AGENT_FILE}' not found. Start fresh."); LOAD_STATE=False
+    auto_reset_params = None
+    if DO_TRAINING and args.auto_reset:
+        auto_reset_params = {'patience': args.reset_patience, 'value': max(0.01, min(1.0, args.reset_value))}
 
-    default_initial_epsilon = 1.0
-    print_mode="Loading" if LOAD_STATE and file_exists else "Start fresh"
-    print(f"{print_mode} agent state: '{AGENT_FILE}'")
+    if args.mode == 'run' and not os.path.exists(AGENT_STATE_FILENAME):
+        print(f"Error: Cannot run. Agent state file '{AGENT_STATE_FILENAME}' not found."); exit(1)
 
-    agent = QLearningAgent(learning_rate=args.lr, discount_factor=args.gamma,
-                           exploration_rate=default_initial_epsilon,
-                           exploration_decay=args.decay, min_exploration_rate=0.01,
-                           q_table_file=AGENT_FILE)
+    if DO_TRAINING and LOAD_AGENT_STATE and os.path.exists(AGENT_STATE_FILENAME): print(f"Found '{AGENT_STATE_FILENAME}'. Checking compatibility...")
+    elif DO_TRAINING and LOAD_AGENT_STATE and not os.path.exists(AGENT_STATE_FILENAME): print(f"Warning: Load requested but '{AGENT_STATE_FILENAME}' not found. Starting fresh."); LOAD_AGENT_STATE = False
+    elif DO_TRAINING and not LOAD_AGENT_STATE: print(f"Starting fresh training (--fresh specified).")
 
-    if LOAD_STATE and not agent.q_table and file_exists:
-        print("Warn: Load failed or file empty. Resetting epsilon to initial.")
-        agent.epsilon = agent.initial_epsilon
+    print("-" * 30)
+    # Agent creation uses the new defaults defined in the QLearningAgent class
+    agent = QLearningAgent(q_table_file=AGENT_STATE_FILENAME)
+    print("-" * 30)
 
     if args.reset_epsilon is not None:
-         print(f"!!! Force resetting epsilon via command line: {args.reset_epsilon:.4f} !!!")
-         agent.epsilon = max(agent.min_epsilon, min(1.0, args.reset_epsilon))
+         manual_eps_val = max(agent.min_epsilon, min(1.0, args.reset_epsilon))
+         print(f"!!! MANUALLY Setting starting Epsilon to: {manual_eps_val:.4f} !!!")
+         agent.epsilon = manual_eps_val; agent.initial_epsilon = manual_eps_val
 
-    start_time = time.time(); high_score = 0; e_type = None; scores = []
-    try: scores, high_score = run_game(agent, train=DO_TRAINING, num_episodes=NUM_EPISODES, render=RENDER_GAME, max_steps_per_episode=MAX_STEPS)
+    session_start_time = time.time(); session_high_score_final = 0; session_scores = []; e_type = None
+
+    try:
+        session_scores, session_high_score_final = run_game(
+            agent, train=DO_TRAINING, num_episodes=NUM_EPISODES_ARG, render=RENDER_GAME,
+            max_steps_per_episode=MAX_STEPS, auto_reset_config=auto_reset_params
+        )
     except KeyboardInterrupt: print(f"\n{args.mode.capitalize()} interrupted."); e_type = KeyboardInterrupt
-    except Exception: print(f"\nError:"); traceback.print_exc(); e_type = type(Exception)
+    except Exception as e: print(f"\nUnexpected error: {e}"); traceback.print_exc(); e_type = type(e)
     finally:
-        if DO_TRAINING and e_type is not None:
-            print("Save state on interrupt/error...")
-            if agent: agent.save_q_table()
+        if DO_TRAINING and (e_type is not None or args.mode == 'train'):
+             print("Attempting to save agent state..."); agent.save_q_table()
+             if os.path.exists(agent.q_table_file): print(f"Agent state saved to '{agent.q_table_file}'.")
+             else: print(f"Warning: Failed to save agent state.")
 
-        end_time = time.time(); print(f"\n{args.mode.capitalize()} session finished."); print(f"Duration: {end_time - start_time:.2f}s.")
-        if scores: print(f"Avg score ({len(scores)} games): {np.mean(scores):.2f}")
-        print(f"Session High Score: {high_score}")
-        if agent and (DO_TRAINING or (LOAD_STATE and file_exists)):
-             final_eps=agent.epsilon; final_states=len(agent.q_table)
-             print(f"Final state in '{AGENT_FILE}': {final_states} states, eps {final_eps:.4f}")
+        session_end_time = time.time()
+        print(f"\n--- {args.mode.capitalize()} Session Summary ---")
+        print(f"Duration: {session_end_time - session_start_time:.2f} seconds.")
+        if session_scores:
+             print(f"Episodes completed: {len(session_scores)}")
+             print(f"Average score: {np.mean(session_scores):.2f}")
+             print(f"Highest score: {session_high_score_final}")
+        else: print("No full episodes completed or interrupted early.")
+        if DO_TRAINING: print(f"Final Epsilon: {agent.epsilon:.4f}"); print(f"Total unique states learned: {len(agent.state_value_table)}")
+
     print("\nScript finished.")
